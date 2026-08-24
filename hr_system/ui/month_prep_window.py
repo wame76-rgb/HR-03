@@ -14,6 +14,10 @@
   4. تخطيط RTL: التقويم يميناً، وسجل الإخراج/حالة الاتصال/الأزرار يساراً.
   5. شبكة تقويم على نمط Excel بخطوط رفيعة #D1D5DB تبدأ من الأحد أقصى اليمين.
   6. خانتا اختيار برسالة (علامة) واضحة بدلاً من تظليل الخلفية.
+- v2.2.0 (HR-03 Grid Overhaul): تحويل التقويم إلى QTableWidget حقيقي 7x7 برؤوس
+  مخفية وأسماء الأيام داخل الصف 0، تلوين العمود كاملاً (أحد موف / جمعة وسبت أحمر)،
+  خلايا بنص عادي متعدد الأسطر، إزالة كل QFrame/صناديق فرعية وزوايا دائرية،
+  واستعادة أنماط QMessageBox النظامية الافتراضية عالية التباين.
 """
 
 import os
@@ -22,9 +26,10 @@ import tempfile
 from datetime import date, datetime
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QFrame, QCheckBox, QProgressBar
+    QFrame, QCheckBox, QProgressBar, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QHeaderView
 )
 from PySide6.QtCore import Qt, QThread, Signal, QRectF, QRect
 from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QImage, QPen, QBrush, QIcon
@@ -208,7 +213,7 @@ class MonthPrepThread(QThread):
 
 
 # ======================================================================
-# كارت اليوم الجداري (نمط Excel)
+# الشاشة الرئيسية
 # ======================================================================
 
 class DayCardWidget(QFrame):
@@ -312,7 +317,9 @@ class MonthPrepWindow(QMainWindow):
         self.ts_pwd = self.config.get_password('timesheet')
         self.main_pwd = self.config.get_password('main')
 
-        self.day_widgets = {}
+        self.day_cells = {}
+        self.day_types = {}
+        self.coord_to_day = {}
         self.worker_thread = None
         self.pre_check_thread = None
 
@@ -326,7 +333,7 @@ class MonthPrepWindow(QMainWindow):
         self.setWindowTitle("تهيئة الشهر الجديد")
         self.resize(1200, 780)
         self.setLayoutDirection(Qt.RightToLeft)
-        self.setStyleSheet("background-color: #FAFBFC; font-family: 'Segoe UI';")
+        self.setStyleSheet("font-family: 'Segoe UI';")
 
         # أيقونة النافذة من مجلد الأصول (مع تحقق آمن من المسار)
         icon_path = os.path.join(BASE_DIR, "assests", "logo.png")
@@ -339,6 +346,7 @@ class MonthPrepWindow(QMainWindow):
             self.statusBar().setSizeGripEnabled(False)
 
         self.central_widget = QWidget(self)
+        self.central_widget.setStyleSheet("background-color: #FAFBFC;")
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
         self.main_layout.setContentsMargins(18, 18, 18, 18)
@@ -457,43 +465,29 @@ class MonthPrepWindow(QMainWindow):
         self.bar_layout.addStretch(1)
         self.calendar_layout.addWidget(self.control_bar)
 
-        # إطار التقويم الرئيسي (Excel Grid متصل)
-        self.calendar_wrapper = QFrame(self)
-        self.calendar_wrapper.setStyleSheet(
-            "QFrame { background-color: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 0px; }"
-        )
-        self.inner_calendar_layout = QVBoxLayout(self.calendar_wrapper)
-        self.inner_calendar_layout.setContentsMargins(8, 8, 8, 8)
-        self.inner_calendar_layout.setSpacing(0)
+        # جدول التقويم Excel 7x7 (رؤوس مخفية — أسماء الأيام داخل الصف 0، بلا صناديق فرعية)
+        self.calendar_table = QTableWidget(7, 7, self)
+        self.calendar_table.setLayoutDirection(Qt.RightToLeft)
+        self.calendar_table.horizontalHeader().setVisible(False)
+        self.calendar_table.verticalHeader().setVisible(False)
+        self.calendar_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.calendar_table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.calendar_table.setShowGrid(True)
+        self.calendar_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #FFFFFF; border: 1px solid #D1D5DB;
+                gridline-color: #D1D5DB;
+            }
+        """)
+        self.calendar_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.calendar_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.calendar_table.setFocusPolicy(Qt.NoFocus)
+        self.calendar_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.calendar_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.calendar_table.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.calendar_table.cellClicked.connect(self.on_cell_clicked)
 
-        # رأس الأيام: يبدأ من الأحد (أقصى اليمين) حتى السبت (أقصى اليسار) مع تلوين العمود كاملاً
-        self.header_grid = QGridLayout()
-        self.header_grid.setSpacing(0)
-        weekdays = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
-        col_styles = {
-            0: "#F3E5F5;#8E24AA",  # عمود الأحد (WH) — موف/بنفسجي
-            5: "#FFEAEA;#991B1B",  # عمود الجمعة (R) — أحمر
-            6: "#FFEAEA;#991B1B",  # عمود السبت (R) — أحمر
-        }
-        for idx, day_name in enumerate(weekdays):
-            lbl = QLabel(day_name, self)
-            lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setFixedHeight(32)
-            bg, fg = col_styles.get(idx, "#F8FAFC;#1F2937").split(";")
-            lbl.setStyleSheet(
-                f"QLabel {{ color: {fg}; background-color: {bg}; border: 1px solid #D1D5DB; }}"
-            )
-            self.header_grid.addWidget(lbl, 0, idx)
-        self.inner_calendar_layout.addLayout(self.header_grid)
-
-        # شبكة التقويم (مسافات صفر لضمان الاتصال الكامل)
-        self.grid_layout = QGridLayout()
-        self.grid_layout.setSpacing(0)
-        self.grid_layout.setContentsMargins(0, 0, 0, 0)
-        self.inner_calendar_layout.addLayout(self.grid_layout)
-
-        self.calendar_layout.addWidget(self.calendar_wrapper, 1)
+        self.calendar_layout.addWidget(self.calendar_table, 1)
 
         # --------------------------------------------------
         # يساراً: سجل الإخراج + حالة الاتصال + الأزرار
@@ -660,37 +654,44 @@ class MonthPrepWindow(QMainWindow):
         self.update_month_display()
 
     def on_wfh_state_changed(self):
-        """تحديث أيام الأحد تلقائياً عند تغيير تفعيل العمل عن بعد."""
-        for day_num, card in self.day_widgets.items():
-            current_date = datetime(self.current_year, self.current_month, day_num)
-            if current_date.weekday() == 6 and card.day_type in ('WORK', 'WH'):
-                card.day_type = 'WH' if self.wfh_chk.isChecked() else 'WORK'
-                card.apply_state_style()
+        """تظليل/إزالة عمود الأحد الكامل (رأسه وخلاياه) عند تغيير تفعيل العمل عن بعد."""
+        for day_num in list(self.day_types.keys()):
+            if datetime(self.current_year, self.current_month, day_num).weekday() == 6 \
+                    and self.day_types[day_num] in ('WORK', 'WH'):
+                self.day_types[day_num] = 'WH' if self.wfh_chk.isChecked() else 'WORK'
+                self.apply_cell_style(day_num)
+
+        # تلوين رأس عمود الأحد (الصف 0) تبعاً لحالة العمل عن بعد
+        header_item = self.calendar_table.item(0, 0)
+        if header_item is not None:
+            if self.wfh_chk.isChecked():
+                header_item.setForeground(QBrush(QColor("#8E24AA")))
+                header_item.setBackground(QBrush(QColor("#F3E5F5")))
+            else:
+                header_item.setForeground(QBrush(QColor("#1F2937")))
+                header_item.setBackground(QBrush(QColor("#F8FAFC")))
+
         self.update_statistics()
 
     # ------------------------------------------------------------------
     # شبكة التقويم
     # ------------------------------------------------------------------
     def generate_calendar_grid(self):
-        """توليد خلايا التقويم RTL: الأحد أقصى اليمين ثم حتى السبت أقصى اليسار."""
-        for i in reversed(range(self.grid_layout.count())):
-            widget = self.grid_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.deleteLater()
-        self.day_widgets.clear()
+        """توليد جدول التقويم 7x7 RTL: الأحد أقصى اليمين (عمود 0) حتى السبت أقصى اليسار."""
+        self.day_cells.clear()
+        self.day_types.clear()
+        self.coord_to_day.clear()
 
         first_day_weekday = date(self.current_year, self.current_month, 1).weekday()
         num_days = calendar.monthrange(self.current_year, self.current_month)[1]
 
-        # خريطة weekday() إلى العمود: الأحد(6)->عمود0 (يمين)، السبت(5)->عمود6 (يسار)
+        # خريطة weekday() إلى العمود: الأحد(6)->0 (يمين) ... السبت(5)->6 (يسار)
         mapping = {6: 0, 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6}
         col = mapping[first_day_weekday]
         row = 1
 
         for day_num in range(1, num_days + 1):
-            current_date = datetime(self.current_year, self.current_month, day_num)
-            dow = current_date.weekday()
-
+            dow = datetime(self.current_year, self.current_month, day_num).weekday()
             if dow in (4, 5):
                 day_type = 'REST'
             elif dow == 6 and self.wfh_chk.isChecked():
@@ -698,27 +699,94 @@ class MonthPrepWindow(QMainWindow):
             else:
                 day_type = 'WORK'
 
-            card = DayCardWidget(day_num, day_type, self)
-            self.day_widgets[day_num] = card
-            self.grid_layout.addWidget(card, row, col)
+            self.day_cells[day_num] = (row, col)
+            self.day_types[day_num] = day_type
+            self.coord_to_day[(row, col)] = day_num
 
             col += 1
             if col > 6:
                 col = 0
                 row += 1
 
+        self.render_calendar_table()
+
+    def render_calendar_table(self):
+        """رسم أسماء الأيام في الصف 0 وكافة خلايا الشهر (بدون رؤوس منفصلة)."""
+        self.calendar_table.setRowCount(7)
+        self.calendar_table.setColumnCount(7)
+
+        weekdays = ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+        col_colors = {
+            0: ("#F3E5F5", "#8E24AA"),  # الأحد — موف/بنفسجي
+            5: ("#FFEAEA", "#991B1B"),  # الجمعة — أحمر
+            6: ("#FFEAEA", "#991B1B"),  # السبت — أحمر
+        }
+        for col in range(7):
+            if col == 0 and not self.wfh_chk.isChecked():
+                bg, fg = "#F8FAFC", "#1F2937"
+            else:
+                bg, fg = col_colors.get(col, ("#F8FAFC", "#1F2937"))
+            item = QTableWidgetItem(weekdays[col])
+            item.setTextAlignment(Qt.AlignCenter)
+            item.setForeground(QBrush(QColor(fg)))
+            item.setBackground(QBrush(QColor(bg)))
+            item.setFont(QFont("Segoe UI", 12, QFont.Bold))
+            self.calendar_table.setItem(0, col, item)
+
+        for day_num in self.day_cells:
+            self.apply_cell_style(day_num)
+
+    def apply_cell_style(self, day_num):
+        """تلوين خلية اليوم حسب عمودها (مع خيار العطلة الأزرق) بنص عادي متعدد الأسطر."""
+        row, col = self.day_cells[day_num]
+        dt = self.day_types[day_num]
+
+        if dt == 'HOLIDAY':
+            bg, fg, code = "#E0F2FE", "#1F2937", "H"
+        elif dt == 'REST':
+            bg, fg, code = "#FFEAEA", "#1F2937", "R"
+        elif dt == 'WH':
+            bg, fg, code = "#F3E5F5", "#8E24AA", "WH"
+        else:
+            bg, fg, code = "#FFFFFF", "#1F2937", ""
+
+        text = str(day_num) if not code else f"{day_num}\n{code}"
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setForeground(QBrush(QColor(fg)))
+        item.setBackground(QBrush(QColor(bg)))
+        self.calendar_table.setItem(row, col, item)
+
+    def on_cell_clicked(self, row, col):
+        """تبديل أي يوم إلى عطلة (H) بضغطة واحدة عند تفعيل خانة العطلات الرسمية."""
+        if row == 0 or not self.holidays_chk.isChecked():
+            return
+        day_num = self.coord_to_day.get((row, col))
+        if day_num is None:
+            return
+        self.day_types[day_num] = 'HOLIDAY' if self.day_types[day_num] != 'HOLIDAY' else self.default_type(day_num)
+        self.apply_cell_style(day_num)
         self.update_statistics()
+
+    def default_type(self, day_num):
+        """الحالة الافتراضية لليوم حسب يوم الأسبوع."""
+        dow = datetime(self.current_year, self.current_month, day_num).weekday()
+        if dow in (4, 5):
+            return 'REST'
+        if dow == 6:
+            return 'WH' if self.wfh_chk.isChecked() else 'WORK'
+        return 'WORK'
 
     def update_statistics(self):
         work = rest = wh = holiday = 0
-        for card in self.day_widgets.values():
-            if card.day_type == 'WORK':
+        for dt in self.day_types.values():
+            if dt == 'WORK':
                 work += 1
-            elif card.day_type == 'REST':
+            elif dt == 'REST':
                 rest += 1
-            elif card.day_type == 'WH':
+            elif dt == 'WH':
                 wh += 1
-            elif card.day_type == 'HOLIDAY':
+            elif dt == 'HOLIDAY':
                 holiday += 1
 
         self.lbl_stat_work.setText(f"عمل: {work}")
@@ -727,7 +795,7 @@ class MonthPrepWindow(QMainWindow):
         self.lbl_stat_h.setText(f"عطلة H: {holiday}")
 
     def get_holidays_list(self):
-        return [day_num for day_num, card in self.day_widgets.items() if card.day_type == 'HOLIDAY']
+        return [day_num for day_num, dt in self.day_types.items() if dt == 'HOLIDAY']
 
     # ------------------------------------------------------------------
     # دورة التهيئة الكاملة
@@ -786,7 +854,24 @@ class MonthPrepWindow(QMainWindow):
 
         num_days = calendar.monthrange(self.current_year, self.current_month)[1]
 
-        # 1) هل الشهر مُهيأ مسبقاً؟ -> رسالة تأكيد إعادة التهيئة
+        # (أ) التحقق المسبق من اكتمال الأيام أولاً: أي يوم مفقود = إيقاف فوري برسالة عربية واضحة
+        required_days = set(range(1, num_days + 1))
+        missing = required_days - set(present_days)
+        if missing:
+            missing_text = ", ".join(str(d) for d in sorted(missing))
+            self.set_controls_enabled(True)
+            self.progress_bar.setVisible(False)
+            self.lbl_thread_status.setVisible(False)
+            self.append_log(f"إيقاف التهيئة: أيام مفقودة من var_op ({missing_text}).")
+            QMessageBox.critical(
+                self, "فشل الاتصال / التهيئة 🔴",
+                f"توقفت عملية التهيئة: بعض أيام الشهر غير موجودة في جدول var_op.\n"
+                f"الأيام المفقودة: {missing_text}\n"
+                f"لا يمكن متابعة التهيئة قبل اكتمال أيام الشهر في قاعدة البيانات."
+            )
+            return
+
+        # (ب) هل الشهر مُهيأ مسبقاً؟ -> رسالة تأكيد إعادة التهيئة
         if has_records:
             self.append_log(f"التحقق المسبق: الشهر مُهيأ مسبقاً ({count:,} سجل موجود).")
             confirm = QMessageBox.question(
@@ -799,23 +884,6 @@ class MonthPrepWindow(QMainWindow):
                 self.progress_bar.setVisible(False)
                 self.lbl_thread_status.setVisible(False)
                 self.append_log("تم إلغاء إعادة التهيئة بواسطة المستخدم.")
-                return
-
-            # 2) التحقق من اكتمال الأيام: أي يوم مفقود = إيقاف صريح
-            required_days = set(range(1, num_days + 1))
-            missing = required_days - set(present_days)
-            if missing:
-                missing_text = ", ".join(str(d) for d in sorted(missing))
-                self.set_controls_enabled(True)
-                self.progress_bar.setVisible(False)
-                self.lbl_thread_status.setVisible(False)
-                self.append_log(f"إيقاف التهيئة: أيام مفقودة من var_op ({missing_text}).")
-                QMessageBox.critical(
-                    self, "فشل الاتصال / التهيئة 🔴",
-                    f"توقفت عملية التهيئة: بعض أيام الشهر غير موجودة في جدول var_op.\n"
-                    f"الأيام المفقودة: {missing_text}\n"
-                    f"لا يمكن متابعة التهيئة قبل اكتمال أيام الشهر في قاعدة البيانات."
-                )
                 return
         else:
             self.append_log(f"التحقق المسبق: الشهر غير مُهيأ مسبقاً ({count} سجل).")
