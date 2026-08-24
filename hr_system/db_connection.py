@@ -5,9 +5,10 @@ from datetime import date, datetime
 
 
 class DatabaseConnection:
-    def __init__(self, retry_attempts=3, retry_delay_ms=100):
+    def __init__(self, retry_attempts=3, retry_delay_ms=100, connect_timeout=8):
         self.retry_attempts = retry_attempts
         self.retry_delay_ms = retry_delay_ms / 1000.0
+        self.connect_timeout = connect_timeout
         self._connections = {}
 
     def get_connection(self, db_path, password=""):
@@ -32,7 +33,8 @@ class DatabaseConnection:
         conn_str = f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={db_path};"
         if password:
             conn_str += f"PWD={password};"
-        conn = pyodbc.connect(conn_str, timeout=5)
+        # timeout محدد يمنع تعليق الاتصال عند انقطاع الشبكة أو قفل الملف
+        conn = pyodbc.connect(conn_str, timeout=self.connect_timeout)
         self._connections[key] = conn
         return conn
 
@@ -55,6 +57,9 @@ class DatabaseConnection:
                 result = operation(conn)
                 conn.commit()
                 return result
+            except InterruptedError as e:
+                # إلغاء المستخدم: لا يُعاد التنفيذ إطلاقاً
+                raise e
             except (pyodbc.Error, Exception) as e:
                 last_error = e
                 key = (db_path, password)
@@ -234,6 +239,43 @@ class DatabaseConnection:
             return (count > 0), count
         return self.execute_with_retry(ts_db_path, op, db_password)
 
+    def get_month_present_days(self, ts_db_path, issue, db_password=""):
+        """مجموعة أيام الشهر الموجودة فعلياً في var_op للشهر المستهدف (من 1 إلى آخر يوم)"""
+        def op(conn):
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT DatePart('d', EntryDate) FROM var_op WHERE Issue = ?",
+                (int(issue),),
+            )
+            return {int(r[0]) for r in cursor.fetchall() if r[0] is not None}
+        return self.execute_with_retry(ts_db_path, op, db_password)
+
+    def pre_check_month(self, ts_db_path, issue, db_password=""):
+        """الفحص الصامت المسبق الموحد:
+        يرجع (count, present_days) حيث count عدد سجلات الشهر الموجود،
+        و present_days مجموعة أيام الشهر المتواجدة فعلياً.
+        يعتمد على عمود Issue المفهرس لتجنب أي مسح شامل غير مقيد."""
+        def op(conn):
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM var_op WHERE Issue = ?", (int(issue),))
+            row = cursor.fetchone()
+            count = int(row[0]) if row else 0
+            cursor.execute(
+                "SELECT DISTINCT DatePart('d', EntryDate) FROM var_op WHERE Issue = ?",
+                (int(issue),),
+            )
+            days = {int(r[0]) for r in cursor.fetchall() if r[0] is not None}
+            return count, days
+        return self.execute_with_retry(ts_db_path, op, db_password)
+
+    def delete_month_records(self, ts_db_path, issue, db_password=""):
+        """حذف آمن وغير معرقل لسجلات شهر محدد من var_op قبل إعادة التهيئة"""
+        def op(conn):
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM var_op WHERE Issue = ?", (int(issue),))
+            return cursor.rowcount
+        return self.execute_with_retry(ts_db_path, op, db_password)
+
     def get_active_employees_count(self, main_db_path, db_password=""):
         """عدد الموظفين الفعالين (الذين لم تنته خدمتهم: enha2_date فارغ)"""
         def op(conn):
@@ -269,72 +311,129 @@ class DatabaseConnection:
         main_db_path,
         issue,
         dates_list,
+        code_map,
         holidays_set=None,
-        holiday_var_code=None,
+        wfh_active=True,
+        preserve_weekend_overrides=True,
+        batch_size=200,
+        main_db_password="",
+        ts_db_password="",
+        interrupt_check=None,
         progress_callback=None,
-        db_password=""
     ):
         """
-        تنفيذ عملية التهيئة الشاملة:
-        1. تفريغ وتعبئة جدول DatePrep.
+        التهيئة الآمنة لشهر كامل (إعادة البناء المتسامحة مع الخطأ):
+
+        خوارزمية مقاومة لانهيار HY000 والقيود الافتراضية:
+        1. تعبئة جدول DatePrep بأيام الشهر المستهدف.
         2. جلب الموظفين الفعالين من basic (enha2_date IS NULL).
-        3. إدراج مجمع لسجلات var_op لكل موظف ولكل يوم من أيام الشهر.
+        3. حارس الجمعة/السبت/الأحد: جلب أي تعديلات يدوية سابقة (قيمة غير صفرية)
+           وحفظها قبل أي حذف لعدم الكتابة فوقها لاحقاً.
+        4. حذف سجلات الشهر الحالي من var_op إن وُجدت (بعد موافقة المستخدم).
+        5. إدراج مجزأ بدفعات صغيرة (batch_size = 200 صفاً افتراضياً) مع
+           conn.commit() بعد كل دفعة لمنع انسداد الشبكة وقفل السائق
+           وتفادي تجاوز حدود معاملات الاستعلام الواحد.
+        6. النقل الانتقائي: فقط الحالات الثلاث (H / R / WH) تُعبأ برموزها،
+           أما أيام العمل العادية فتُترك بقيمتها الافتراضية (0).
         """
         issue_val = int(issue)
         holidays_set = holidays_set or set()
+        code_map = code_map or {}
 
         # الخطوة 1: تعبئة جدول DatePrep
-        self.populate_date_prep(ts_db_path, dates_list, db_password)
+        self.populate_date_prep(ts_db_path, dates_list, ts_db_password)
         if progress_callback:
-            progress_callback(10, "تم تجهيز جدول التواريخ DatePrep بنجاح...")
+            progress_callback(5, "تم تجهيز جدول التواريخ DatePrep")
 
         # الخطوة 2: جلب أرقام العاملين النشطين
-        active_emp_ids = self.get_active_employee_ids(main_db_path, db_password)
+        active_emp_ids = self.get_active_employee_ids(main_db_path, main_db_password)
         total_emps = len(active_emp_ids)
         if total_emps == 0:
             raise ValueError("لم يتم العثور على أي موظفين فعالين في جدول basic (حقل enha2_date فارغ).")
 
         if progress_callback:
-            progress_callback(25, f"تم حصر {total_emps} موظف فعال...")
+            progress_callback(10, f"تم حصر {total_emps} موظف فعال")
 
-        # الخطوة 3: تجهيز وإدراج سجلات var_op مجمعة
+        # خريطة التاريخ -> رمز المتغير (0 لأيام العمل العادية)
+        day_var_map = {}
+        for dt in dates_list:
+            dow = dt.weekday()  # Monday=0 ... Sunday=6
+            if dt in holidays_set or dt.strftime("%Y-%m-%d") in holidays_set:
+                day_var_map[dt] = int(code_map.get('H') or 0)
+            elif dow in (4, 5):  # الجمعة والسبت
+                day_var_map[dt] = int(code_map.get('R') or 0)
+            elif dow == 6 and wfh_active:  # الأحد مع تفعيل العمل عن بعد
+                day_var_map[dt] = int(code_map.get('WH') or 0)
+            else:
+                day_var_map[dt] = 0
+
         def op(conn):
             cursor = conn.cursor()
+
+            # الخطوة 3: حارس الجمعة/السبت/الأحد — حفظ التعديلات اليدوية السابقة
+            preserved = {}
+            if preserve_weekend_overrides:
+                weekend_days = [dt for dt in dates_list if dt.weekday() in (4, 5, 6)]
+                if weekend_days:
+                    day_nums = sorted({dt.day for dt in weekend_days})
+                    placeholders = ",".join("?" * len(day_nums))
+                    try:
+                        cursor.execute(
+                            "SELECT EmpId, DatePart('d', EntryDate), var FROM var_op "
+                            "WHERE Issue = ? AND var IS NOT NULL AND var <> 0 "
+                            f"AND DatePart('d', EntryDate) IN ({placeholders})",
+                            [issue_val] + day_nums,
+                        )
+                        for emp_id, day_num, var in cursor.fetchall():
+                            preserved[(emp_id, day_num)] = var
+                    except Exception:
+                        preserved = {}
+
+            # الخطوة 4: حذف سجلات الشهر إن وُجدت (مسح الحركات الحالية بموافقة المستخدم)
+            cursor.execute("DELETE FROM var_op WHERE Issue = ?", (issue_val,))
+
             insert_query = (
                 "INSERT INTO var_op (Issue, EmpId, EntryDate, var, wp, Notes) "
                 "VALUES (?, ?, ?, ?, NULL, NULL)"
             )
-
-            # إعداد الحزم للإدراج المجمع (Chunked Batch Insert)
-            batch = []
-            batch_size = 2000
             total_records = total_emps * len(dates_list)
             inserted_count = 0
+            batch = []
 
             for emp_idx, emp_id in enumerate(active_emp_ids, start=1):
+                if interrupt_check and interrupt_check():
+                    conn.rollback()
+                    raise InterruptedError("تم إلغاء العملية بواسطة المستخدم.")
+
                 for dt in dates_list:
-                    # تحديد ما إذا كان اليوم عطلة رسمية محددة
-                    is_holiday = dt in holidays_set or dt.strftime("%Y-%m-%d") in holidays_set
-                    var_val = holiday_var_code if (is_holiday and holiday_var_code is not None) else None
+                    var_val = day_var_map[dt]
+                    # حارس الأمان: أي قيمة سابقة غير صفرية في الجمعة/السبت/الأحد تُحفظ كما هي
+                    if preserve_weekend_overrides and dt.weekday() in (4, 5, 6):
+                        saved = preserved.get((emp_id, dt.day))
+                        if saved is not None:
+                            var_val = int(saved)
                     batch.append((issue_val, emp_id, dt, var_val))
 
                 if len(batch) >= batch_size:
                     cursor.executemany(insert_query, batch)
+                    conn.commit()
                     inserted_count += len(batch)
                     batch.clear()
-
                     if progress_callback:
-                        pct = 25 + int((inserted_count / total_records) * 70)
-                        progress_callback(pct, f"تم إنشاء {inserted_count:,} من أصل {total_records:,} سجل...")
+                        pct = 10 + int((inserted_count / total_records) * 85)
+                        progress_callback(pct, f"تم إنشاء {inserted_count:,} من أصل {total_records:,} سجل")
 
             if batch:
                 cursor.executemany(insert_query, batch)
+                conn.commit()
                 inserted_count += len(batch)
-                batch.clear()
+
+            if progress_callback:
+                progress_callback(95, "جارٍ تثبيت النتائج النهائية...")
 
             return inserted_count
 
-        records_count = self.execute_with_retry(ts_db_path, op, db_password)
+        records_count = self.execute_with_retry(ts_db_path, op, ts_db_password)
 
         if progress_callback:
             progress_callback(100, f"اكتملت التهيئة بنجاح بإجمالي {records_count:,} سجل.")

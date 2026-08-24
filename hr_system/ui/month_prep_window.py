@@ -1,303 +1,331 @@
 # -*- coding: utf-8 -*-
 """
 شاشة تهيئة بداية الشهر - نظام إدارة الموارد البشرية
-التاريخ: 2026-08-23
+التاريخ: 2026-08-24
 سجل التعديلات:
 - v1.0.0: الشاشة الأساسية وتجهيز التقويم وربط الخيوط.
-- v1.1.0: إصلاح صريح وحاسم لمسارات قواعد البيانات (Path Resolution Fix):
-1. القراءة الصحيحة من قسم DATABASE عبر ConfigManager بدلاً من 'paths'.
-2. توحيد وحساب المسارات المطلقة اعتماداً على BASE_DIR لحماية الاتصال من الانهيار.
-3. ربط كلمات المرور المشفرة لملفي TimeSheet و Main بشكل منفصل دقيق.
-4. منع ظهور رسالة الخطأ (مسار قاعدة البيانات فارغ) وعرض المسار الفيزيائي الحقيقي في كارت الحالة.
+- v1.1.0: إصلاح صريح وحاسم لمسارات قواعد البيانات (Path Resolution Fix).
+- v2.0.0 (HR-03): إعادة تصميم شاملة وفق المواصفات:
+  1. إصلاح انهيار ODBC (HY000) وانتهاك القيد الرئيسي (EmpId + EntryDate):
+     فحص مسبق صامت، رسالة تأكيد إعادة التهيئة، حذف آمن، وإدراج مجزأ بدفعات
+     صغيرة (200 صف) عبر execute_with_retry.
+  2. تحويل انتقائي: فقط H / R / WH تُعبأ، وأيام العمل العادية تبقى 0.
+  3. حارس الجمعة/السبت/الأحد: حفظ التعديلات اليدوية غير الصفرية دون الكتابة فوقها.
+  4. تخطيط RTL: التقويم يميناً، وسجل الإخراج/حالة الاتصال/الأزرار يساراً.
+  5. شبكة تقويم على نمط Excel بخطوط رفيعة #D1D5DB تبدأ من الأحد أقصى اليمين.
+  6. خانتا اختيار برسالة (علامة) واضحة بدلاً من تظليل الخلفية.
 """
 
 import os
 import calendar
-import datetime
-import pyodbc
+import tempfile
 from datetime import date, datetime
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QLineEdit, QComboBox, QListWidget, QTableWidget,
-    QTableWidgetItem, QMessageBox, QFrame, QDateEdit, QHeaderView,
-    QCheckBox, QProgressBar, QApplication
+    QPushButton, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QFrame, QCheckBox, QProgressBar
 )
-from PySide6.QtCore import Qt, QSize, QThread, Signal, QTimer
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtCore import Qt, QThread, Signal, QRectF, QRect
+from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QImage, QPen, QBrush
 
-# BASE_DIR Resolution
+from db_connection import DatabaseConnection
+
+# BASE_DIR Resolution (مجلد hr_system نفسه)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+# ======================================================================
+# دوال مساعدة للتصميم
+# ======================================================================
+
+def make_checkmark_png(color_hex):
+    """توليد صورة علامة صح (box + ✔) ملوّنة بمسار مؤقت لاستخدامها في خانة الاختيار."""
+    file_path = os.path.join(tempfile.gettempdir(), f"hr_check_{color_hex.lstrip('#')}.png")
+    if os.path.exists(file_path):
+        return file_path.replace("\\", "/")
+
+    box = 20
+    img = QImage(box, box, QImage.Format_ARGB32)
+    img.fill(Qt.transparent)
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    color = QColor(color_hex)
+    painter.setPen(QPen(color, 2))
+    painter.setBrush(QBrush(QColor("#ffffff")))
+    painter.drawRoundedRect(QRectF(1, 1, box - 2, box - 2), 4, 4)
+
+    painter.setPen(QPen(color, 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    path = QPainterPath()
+    path.moveTo(4, box * 0.55)
+    path.lineTo(box * 0.42, box * 0.78)
+    path.lineTo(box * 0.82, box * 0.26)
+    painter.drawPath(path)
+    painter.end()
+
+    img.save(file_path, "PNG")
+    return file_path.replace("\\", "/")
+
+
+def checkbox_stylesheet(color_hex, check_png):
+    """ورقة أنماط خانة الاختيار: إطار ملوّن وعلامة صح واضحة داخل الصندوق دون تظليل الخلفية."""
+    return f"""
+        QCheckBox {{
+            color: #202124; font-weight: bold; spacing: 8px;
+            background: transparent;
+        }}
+        QCheckBox::indicator {{
+            width: 20px; height: 20px;
+            border: 2px solid {color_hex};
+            border-radius: 5px; background: #ffffff;
+        }}
+        QCheckBox::indicator:hover {{ background: #f8f9fa; }}
+        QCheckBox::indicator:checked {{
+            background: #ffffff; border: 2px solid {color_hex};
+            image: url({check_png});
+        }}
+    """
+
+
+def translate_odbc_error(error_msg):
+    """ترجمة الأخطاء التقنية الشائعة إلى عربية احترافية واضحة مع إبقاء الخطأ الأصلي."""
+    msg = (error_msg or "").lower()
+    if not msg.strip():
+        return "حدث خطأ غير معروف أثناء العملية."
+    if "primary key" in msg or "unique" in msg or "duplicate" in msg or "constraint" in msg:
+        return ("انتهاك القيد الرئيسي (EmpId + EntryDate): سجل مكرر في جدول var_op. "
+                "تمت معالجة الحذف المسبق تلقائياً، حاول مرة أخرى.")
+    if "hy000" in msg or "driver did not supply" in msg:
+        return ("خطأ من برنامج تشغيل Access (HY000): \"The driver did not supply an error!\". "
+                "أغلق أي نافذة Access تفتح الملف نفسه، ثم أعد المحاولة بعد لحظات.")
+    if "locked" in msg or "busy" in msg or "could not use" in msg or "record" in msg:
+        return ("ملف قاعدة البيانات مقفل أو قيد الاستخدام من برنامج آخر. "
+                "أغلق ملف Access من أي نافذة مفتوحة ثم أعد المحاولة.")
+    if "could not find" in msg or "file not found" in msg or "dbq" in msg:
+        return "تعذر العثور على ملف قاعدة البيانات المحدد في المسار المُعد."
+    if "timeout" in msg:
+        return "انتهت مهلة الاتصال بقاعدة البيانات. تأكد من سلامة الشبكة أو المسار."
+    if "password" in msg or "pwd" in msg:
+        return "كلمة مرور قاعدة البيانات غير صحيحة أو غير مشفرة بشكل سليم."
+    return error_msg
+
+
+# ======================================================================
+# خيط الفحص المسبق (Pre-Check) — لا يجمد الواجهة
+# ======================================================================
+
+class MonthPreCheckThread(QThread):
+    """فحص مسبق صامت: هل الشهر مُهيأ مسبقاً؟ وهل كل أيامه موجودة في var_op؟"""
+    pre_check_result = Signal(bool, bool, int, set, str)
+
+    def __init__(self, db_helper, ts_path, ts_pwd, issue, parent=None):
+        super().__init__(parent)
+        self.db = db_helper
+        self.ts_path = ts_path
+        self.ts_pwd = ts_pwd
+        self.issue = issue
+
+    def run(self):
+        try:
+            count, present_days = self.db.pre_check_month(self.ts_path, self.issue, self.ts_pwd)
+            self.pre_check_result.emit(True, count > 0, count, present_days, "")
+        except Exception as e:
+            self.pre_check_result.emit(False, False, 0, set(), str(e))
+
+
+# ======================================================================
+# خيط المعالجة الخلفية للتهيئة المليونية
+# ======================================================================
+
 class MonthPrepThread(QThread):
-    """خيط معالجة خلفي مستقل لتنفيذ عملية تهيئة الشهر المليونية دون تجميد الواجهة"""
+    """خيط مستقل لتنفيذ عملية تهيئة الشهر دون تجميد الواجهة (حذف آمن + إدراج مجزأ)."""
     progress_updated = Signal(int)
     status_updated = Signal(str)
-    initialization_completed = Signal(int, int) # (employees, records)
+    initialization_completed = Signal(int, int)  # (employees, records)
     initialization_failed = Signal(str)
 
-    def __init__(self, main_path, ts_path, main_pwd, ts_pwd, target_month, wfh_active, holidays_list):
-        super().__init__()
+    def __init__(self, db_helper, main_path, ts_path, main_pwd, ts_pwd,
+                 year, month, issue, num_days, wfh_active, holidays_list, parent=None):
+        super().__init__(parent)
+        self.db = db_helper
         self.main_path = main_path
         self.ts_path = ts_path
         self.main_pwd = main_pwd
         self.ts_pwd = ts_pwd
-        self.target_month = target_month # YYYYMM (string)
+        self.year = year
+        self.month = month
+        self.issue = issue
+        self.num_days = num_days
         self.wfh_active = wfh_active
-        self.holidays_list = holidays_list # List of day numbers (integers)
+        self.holidays_list = holidays_list  # قائمة أرقام الأيام (integers)
 
     def run(self):
         try:
-            self.status_updated.emit("جاري الاتصال بقواعد البيانات...")
-            
-            # 1. Main Database Connection to fetch active employees
-            main_conn_str = f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={self.main_path};"
-            if self.main_pwd:
-                main_conn_str += f"PWD={self.main_pwd};"
-            
-            self.status_updated.emit("جاري جلب بيانات الموظفين الفاعلين...")
-            main_conn = pyodbc.connect(main_conn_str)
-            main_cursor = main_conn.cursor()
-            
-            # Fetch active employees (enha2_date is null or > target_month)
-            # Since enha2_date is Date/Time, we compare it safely
-            query_year = int(self.target_month[:4])
-            query_month = int(self.target_month[4:])
-            target_date_str = f"{query_year}/{query_month:02d}/01"
-            
-            main_cursor.execute(f"""
-                SELECT ID, name, work_place 
-                FROM basic 
-                WHERE enha2_date IS NULL OR enha2_date > CDate('{target_date_str}')
-            """)
-            employees = [row for row in main_cursor.fetchall()]
-            main_cursor.close()
-            main_conn.close()
+            self.status_updated.emit("جارٍ الاتصال بقواعد البيانات...")
 
-            if not employees:
-                self.initialization_failed.emit("خطأ: لم يتم العثور على موظفين فاعلين في جدول basic!")
-                return
+            # قراءة رموز المتغيرات من جدول variables
+            self.status_updated.emit("جارٍ قراءة رموز المتغيرات (R / WH / H)...")
+            code_map = {}
+            for v in self.db.get_variables(self.ts_path, self.ts_pwd):
+                key = str(v.get('var', '')).strip().upper()
+                if key in ('R', 'WH', 'H'):
+                    code_map[key] = int(v['code'])
+            code_map.setdefault('R', 5)
+            code_map.setdefault('WH', 35)
+            code_map.setdefault('H', 4)
 
-            self.status_updated.emit("جاري التحضير لترحيل البيانات لجدول var_op...")
+            dates_list = [date(self.year, self.month, day) for day in range(1, self.num_days + 1)]
+            holidays_set = {date(self.year, self.month, d) for d in self.holidays_list}
 
-            # 2. Timesheet Database Connection
-            ts_conn_str = f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={self.ts_path};"
-            if self.ts_pwd:
-                ts_conn_str += f"PWD={self.ts_pwd};"
-                
-            ts_conn = pyodbc.connect(ts_conn_str)
-            ts_cursor = ts_conn.cursor()
+            def progress(pct, msg):
+                self.progress_updated.emit(pct)
+                self.status_updated.emit(msg)
 
-            # Dynamic code retrieval from variables table
-            ts_cursor.execute("SELECT var_code, var FROM variables")
-            var_mapping = {}
-            for row in ts_cursor.fetchall():
-                var_mapping[str(row[1]).strip().upper()] = row[0]
+            self.status_updated.emit("جارٍ تنفيذ التهيئة الآمنة (حذف الشهر + إدراج مجزأ بدفعات 200)...")
+            result = self.db.initialize_month_records(
+                ts_db_path=self.ts_path,
+                main_db_path=self.main_path,
+                issue=self.issue,
+                dates_list=dates_list,
+                code_map=code_map,
+                holidays_set=holidays_set,
+                wfh_active=self.wfh_active,
+                preserve_weekend_overrides=True,
+                batch_size=200,
+                main_db_password=self.main_pwd,
+                ts_db_password=self.ts_pwd,
+                interrupt_check=lambda: self.isInterruptionRequested(),
+                progress_callback=progress,
+            )
 
-            code_R = var_mapping.get('R', 5) # Default R fallback code
-            code_WH = var_mapping.get('WH', 35) # Default WH fallback code
-            code_H = var_mapping.get('H', 4) # Default H fallback code
+            self.initialization_completed.emit(result['total_employees'], result['total_records'])
 
-            # Determine number of days in chosen month
-            num_days = calendar.monthrange(query_year, query_month)[1]
-
-            # Clear existing DatePrep and fill it
-            self.status_updated.emit("جاري تحديث جدول أيام الشهر DatePrep...")
-            ts_cursor.execute("DELETE FROM DatePrep")
-            for day in range(1, num_days + 1):
-                day_date_str = f"{query_year}/{query_month:02d}/{day:02d}"
-                ts_cursor.execute("INSERT INTO DatePrep (EDate) VALUES (CDate(?))", day_date_str)
-            
-            # Start Bulk Insert into var_op
-            # To maximize insert performance on MS Access, we construct tuples and use transaction commit
-            self.status_updated.emit(f"جاري إدراج {len(employees) * num_days} سجل حضور لجدول var_op...")
-            
-            # Retrieve existing keys to prevent duplicates if needed or delete existing month records first
-            ts_cursor.execute("DELETE FROM var_op WHERE Issue = ?", self.target_month)
-            ts_conn.commit()
-
-            inserted_records = 0
-            total_employees = len(employees)
-
-            for idx, emp in enumerate(employees):
-                emp_id = emp[0]
-                emp_wp = emp[2] if emp[2] is not None else 0
-                
-                # Check cancellation in the middle of thread
-                if self.isInterruptionRequested():
-                    ts_conn.rollback()
-                    self.initialization_failed.emit("تم إلغاء العملية بواسطة المستخدم.")
-                    return
-
-                for day in range(1, num_days + 1):
-                    current_date = datetime(query_year, query_month, day)
-                    day_of_week = current_date.weekday() # 0 is Monday, 6 is Sunday
-                    
-                    # Precedence Rules logic
-                    var_code = 0 # Default work
-                    
-                    if day in self.holidays_list:
-                        var_code = code_H
-                    elif day_of_week in (4, 5): # Friday or Saturday
-                        var_code = code_R
-                    elif day_of_week == 6 and self.wfh_active: # Sunday
-                        var_code = code_WH
-                    
-                    day_date_str = f"{query_year}/{query_month:02d}/{day:02d}"
-                    
-                    ts_cursor.execute("""
-                        INSERT INTO var_op (Issue, EmpId, EntryDate, var, wp, Notes, [lock])
-                        VALUES (?, ?, CDate(?), ?, ?, NULL, 0)
-                    """, self.target_month, float(emp_id), day_date_str, int(var_code), int(emp_wp))
-                    
-                    inserted_records += 1
-
-                # Update progress per employee
-                progress = int(((idx + 1) / total_employees) * 100)
-                self.progress_updated.emit(progress)
-
-            ts_conn.commit()
-            ts_cursor.close()
-            ts_conn.close()
-
-            self.initialization_completed.emit(total_employees, inserted_records)
-
+        except InterruptedError as e:
+            self.initialization_failed.emit(str(e))
         except Exception as e:
             self.initialization_failed.emit(str(e))
 
 
+# ======================================================================
+# كارت اليوم الجداري (نمط Excel)
+# ======================================================================
+
 class DayCardWidget(QFrame):
-    """تصميم كارت اليوم التفاعلي داخل شبكة التقويم الجداري"""
+    """خلية يوم واحدة داخل شبكة التقويم المتصلة (Gridlines رفيعة #D1D5DB)."""
     def __init__(self, day_num, day_type, parent_window):
         super().__init__()
         self.day_num = day_num
-        self.day_type = day_type # 'WORK', 'REST', 'WH', 'HOLIDAY'
+        self.day_type = day_type  # 'WORK', 'REST', 'WH', 'HOLIDAY'
         self.parent_window = parent_window
         self.init_ui()
 
     def init_ui(self):
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setFrameShadow(QFrame.Plain)
-        self.setFixedSize(85, 75)
-        
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(4, 8, 4, 8)
-        self.layout.setSpacing(4)
-        self.layout.setAlignment(Qt.AlignCenter)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setFixedSize(96, 64)
 
-        # Day Number Label
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(2, 3, 2, 3)
+        self.layout.setSpacing(0)
+
         self.num_label = QLabel(str(self.day_num), self)
-        self.num_label.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.num_label.setObjectName("dayNum")
+        self.num_label.setFont(QFont("Segoe UI", 13, QFont.Bold))
         self.num_label.setAlignment(Qt.AlignCenter)
         self.layout.addWidget(self.num_label)
 
-        # Status Description Label
-        self.status_label = QLabel(self)
-        self.status_label.setFont(QFont("Segoe UI", 10))
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.status_label)
+        self.code_label = QLabel("", self)
+        self.code_label.setObjectName("codeLabel")
+        self.code_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        self.code_label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.code_label, 1)
 
         self.apply_state_style()
 
     def apply_state_style(self):
-        """تطبيق الأنماط اللونية الأربعة المعتمدة في دستور المشروع بدقة متناهية"""
+        """تطبيق لوحة الألوان المعتمدة في المواصفات بدقة عالية."""
         if self.day_type == 'REST':
-            # Fridays and Saturdays
+            # الجمعة والسبت (راحة R) — وردي فاتح
             self.setStyleSheet("""
-                DayCardWidget {
-                    background-color: #f1f3f4;
-                    border: 1px solid #dadce0;
-                    border-radius: 6px;
-                }
-                QLabel {
-                    color: #9aa0a6;
-                }
+                DayCardWidget { background-color: #FFEAEA; border: 1px solid #D1D5DB; }
+                QLabel#dayNum { color: #1F2937; }
+                QLabel#codeLabel { color: #991B1B; }
             """)
-            self.status_label.setText("راحة (R)")
+            self.code_label.setText("R")
         elif self.day_type == 'WH':
-            # Sundays Work From Home
+            # الأحد (عمل عن بعد WH) — بنفسجي/موف ثابت
             self.setStyleSheet("""
-                DayCardWidget {
-                    background-color: #f3e5f5;
-                    border: 1px solid #ab47bc;
-                    border-radius: 6px;
-                }
-                QLabel {
-                    color: #8e24aa;
-                }
+                DayCardWidget { background-color: #F3E5F5; border: 1px solid #D1D5DB; }
+                QLabel#dayNum { color: #1F2937; }
+                QLabel#codeLabel { color: #8E24AA; }
             """)
-            self.status_label.setText("عمل عن بعد (WH)")
+            self.code_label.setText("WH")
         elif self.day_type == 'HOLIDAY':
-            # Selected Official Holiday
+            # عطلة رسمية (H) — أزرق سماوي فاتح
             self.setStyleSheet("""
-                DayCardWidget {
-                    background-color: #1a73e8;
-                    border: 1px solid #1557b0;
-                    border-radius: 6px;
-                }
-                QLabel {
-                    color: #ffffff;
-                }
+                DayCardWidget { background-color: #E0F2FE; border: 1px solid #D1D5DB; }
+                QLabel#dayNum { color: #1F2937; }
+                QLabel#codeLabel { color: #0369A1; }
             """)
-            self.status_label.setText("عطلة (H)")
+            self.code_label.setText("H")
         else:
-            # Normal Work Day
+            # أيام العمل العادية — أبيض نقي بدون كود (تبقى 0 في قاعدة البيانات)
             self.setStyleSheet("""
-                DayCardWidget {
-                    background-color: #ffffff;
-                    border: 1px solid #dadce0;
-                    border-radius: 6px;
-                }
-                QLabel {
-                    color: #202124;
-                }
+                DayCardWidget { background-color: #FFFFFF; border: 1px solid #D1D5DB; }
+                QLabel#dayNum { color: #1F2937; }
+                QLabel#codeLabel { color: #1F2937; }
             """)
-            self.status_label.setText("عمل")
+            self.code_label.setText("")
+
+    def default_type(self):
+        """إرجاع الحالة الافتراضية لليوم حسب يوم الأسبوع."""
+        current_date = datetime(self.parent_window.current_year,
+                                self.parent_window.current_month, self.day_num)
+        dow = current_date.weekday()
+        if dow in (4, 5):
+            return 'REST'
+        if dow == 6:
+            return 'WH' if self.parent_window.wfh_chk.isChecked() else 'WORK'
+        return 'WORK'
 
     def mousePressEvent(self, event):
-        """تغيير الحالة عند النقر فقط إذا كان قفل التعديل ملغياً وكارت اليوم ليس عطلة إجبارية"""
-        if event.button() == Qt.LeftButton:
-            if self.day_type == 'REST':
-                return # Locked Friday/Saturday
-            
-            # Only allow click if "تنشيط تحديد العطلات الرسمية" is checked
-            if not self.parent_window.holidays_chk.isChecked():
-                QMessageBox.warning(self.parent_window, "تنبيه", "برجاء تفعيل خانة الاختيار 'تنشيط تحديد العطلات الرسمية (H)' أولاً لفتح تعديل خلايا التقويم.")
-                return
+        """فتح تعديل الخلايا فقط عند تفعيل خانة العطلات الرسمية (تبديل إلى H بضغطة واحدة)."""
+        if event.button() != Qt.LeftButton:
+            return
+        if not self.parent_window.holidays_chk.isChecked():
+            return
 
-            # Toggle state
-            if self.day_type == 'HOLIDAY':
-                # Revert to normal or WH depending on day of week
-                current_date = datetime(self.parent_window.current_year, self.parent_window.current_month, self.day_num)
-                if current_date.weekday() == 6 and self.parent_window.wfh_chk.isChecked():
-                    self.day_type = 'WH'
-                else:
-                    self.day_type = 'WORK'
-            else:
-                self.day_type = 'HOLIDAY'
+        if self.day_type == 'HOLIDAY':
+            self.day_type = self.default_type()
+        else:
+            self.day_type = 'HOLIDAY'
 
-            self.apply_state_style()
-            self.parent_window.update_statistics()
+        self.apply_state_style()
+        self.parent_window.update_statistics()
 
+
+# ======================================================================
+# الشاشة الرئيسية
+# ======================================================================
 
 class MonthPrepWindow(QMainWindow):
-    """الشاشة الرئيسية الكاملة لتهيئة بداية الشهر والتقويم الجداري المصقول v17"""
+    """الشاشة الكاملة لتهيئة بداية الشهر (HR-03) — التقويم يميناً والتحكم يساراً."""
     def __init__(self, config_manager, db_connection, user_data, parent=None):
         super().__init__(parent)
         self.config = config_manager
         self.db = db_connection
         self.user_data = user_data
 
-        # Parse current date settings
+        # إعدادات التاريخ الحالية
         now = datetime.now()
         self.current_year = now.year
         self.current_month = now.month
 
-        # Retrieve paths safely from DATABASE section
+        # استرجاع المسارات بأمان من قسم DATABASE
         self.ts_path = self.config.config.get('DATABASE', 'timesheet', fallback='')
         self.main_path = self.config.config.get('DATABASE', 'main', fallback='')
 
-        # Ensure absolute resolution relative to BASE_DIR
+        # تحويل المسارات إلى مسارات مطلقة نسبةً إلى BASE_DIR
         if self.ts_path and not os.path.isabs(self.ts_path):
             self.ts_path = os.path.join(BASE_DIR, self.ts_path).replace("\\", "/")
         if self.main_path and not os.path.isabs(self.main_path):
@@ -307,292 +335,320 @@ class MonthPrepWindow(QMainWindow):
         self.main_pwd = self.config.get_password('main')
 
         self.day_widgets = {}
-        self.init_ui()
+        self.worker_thread = None
+        self.pre_check_thread = None
 
+        self.init_ui()
+        self.refresh_connection_status()
+
+    # ------------------------------------------------------------------
+    # البناء البصري
+    # ------------------------------------------------------------------
     def init_ui(self):
         self.setWindowTitle("تهيئة بداية الشهر (DatePrep & Movements Population)")
-        self.resize(1180, 780)
+        self.resize(1200, 780)
         self.setLayoutDirection(Qt.RightToLeft)
-        self.setStyleSheet("background-color: #fafbfc; font-family: 'Segoe UI';")
+        self.setStyleSheet("background-color: #FAFBFC; font-family: 'Segoe UI';")
 
-        # Disable size grip cleanly
         if self.statusBar():
             self.statusBar().setSizeGripEnabled(False)
 
-        # Central Widget & Top Layout
         self.central_widget = QWidget(self)
         self.setCentralWidget(self.central_widget)
         self.main_layout = QHBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(20, 20, 20, 20)
-        self.main_layout.setSpacing(20)
+        self.main_layout.setContentsMargins(18, 18, 18, 18)
+        self.main_layout.setSpacing(18)
 
-        # ----------------------------------------------------
-        # Pane 1: Left Pane (Calendar Area - 60% Stretch)
-        # ----------------------------------------------------
-        self.left_pane = QWidget(self)
-        self.left_layout = QVBoxLayout(self.left_pane)
-        self.left_layout.setContentsMargins(0, 0, 0, 0)
-        self.left_layout.setSpacing(15)
+        # ------------------------------------------
+        # يميناً: لوحة التقويم (Calendar)
+        # ------------------------------------------
+        self.calendar_pane = QWidget(self)
+        self.calendar_layout = QVBoxLayout(self.calendar_pane)
+        self.calendar_layout.setContentsMargins(0, 0, 0, 0)
+        self.calendar_layout.setSpacing(12)
 
-        # Checkbox Control Bar (Styled beautifully per pixel specs)
-        self.control_bar = QFrame(self)
-        self.control_bar.setStyleSheet("""
-            QFrame {
-                background-color: #ffffff;
-                border: 1px solid #e8eaed;
-                border-radius: 8px;
-            }
-            QCheckBox {
-                spacing: 8px;
-                font-weight: bold;
-                color: #3c4043;
-            }
-            QCheckBox::indicator {
-                width: 20px;
-                height: 20px;
-                border: 2px solid #dadce0;
-                border-radius: 4px;
-                background-color: white;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #1a73e8;
-                border-color: #1a73e8;
-                image: url(hr_system/assets/checkmark.svg); /* Or custom tick */
-            }
+        # شريط الشهر المستهدف: صندوق الشهر (MM-YYYY) + أزرار +/- + إحصائيات الشهر
+        self.month_bar = QFrame(self)
+        self.month_bar.setStyleSheet("""
+            QFrame { background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px; }
         """)
-        self.bar_layout = QHBoxLayout(self.control_bar)
-        self.bar_layout.setContentsMargins(15, 12, 15, 12)
-        self.bar_layout.setSpacing(30)
-
-        # Checkbox WH (Default Active)
-        self.wfh_chk = QCheckBox("تفعيل العمل عن بعد (الأحد - WH)", self)
-        self.wfh_chk.setChecked(True)
-        self.wfh_chk.stateChanged.connect(self.on_wfh_state_changed)
-        self.bar_layout.addWidget(self.wfh_chk)
-
-        # Checkbox Holidays H (Default Disabled/Unchecked)
-        self.holidays_chk = QCheckBox("تنشيط تحديد العطلات الرسمية (H)", self)
-        self.holidays_chk.setChecked(False)
-        self.bar_layout.addWidget(self.holidays_chk)
-
-        self.left_layout.addWidget(self.control_bar)
-
-        # Main Calendar Panel Wrapper
-        self.calendar_wrapper = QFrame(self)
-        self.calendar_wrapper.setStyleSheet("background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 8px;")
-        self.calendar_layout = QVBoxLayout(self.calendar_wrapper)
-        self.calendar_layout.setContentsMargins(15, 15, 15, 15)
-        self.calendar_layout.setSpacing(10)
-
-        # Header Titles (Static columns Friday to Saturday RTL)
-        self.header_grid = QGridLayout()
-        self.header_grid.setSpacing(10)
-        weekdays = ["الجمعة", "الخميس", "الأربعاء", "الثلاثاء", "الاثنين", "الأحد", "السبت"]
-        for idx, day_name in enumerate(weekdays):
-            lbl = QLabel(day_name, self)
-            lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet("color: #5f6368; padding-bottom: 5px;")
-            self.header_grid.addWidget(lbl, 0, idx)
-        
-        self.calendar_layout.addLayout(self.header_grid)
-
-        # Calendar Grid
-        self.grid_layout = QGridLayout()
-        self.grid_layout.setSpacing(10)
-        self.calendar_layout.addLayout(self.grid_layout)
-
-        # Add stretch to left side to align beautifully
-        self.left_layout.addWidget(self.calendar_wrapper, 1)
-        self.main_layout.addWidget(self.left_pane, 3)
-
-        # ----------------------------------------------------
-        # Pane 2: Right Pane (Column A - 40% Width)
-        # ----------------------------------------------------
-        self.right_pane = QWidget(self)
-        self.right_pane.setFixedWidth(360)
-        self.right_layout = QVBoxLayout(self.right_pane)
-        self.right_layout.setContentsMargins(0, 0, 0, 0)
-        self.right_layout.setSpacing(15)
-
-        # 1. User Info Card
-        self.user_card = QFrame(self)
-        self.user_card.setStyleSheet("background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 8px;")
-        self.user_layout = QVBoxLayout(self.user_card)
-        self.user_layout.setContentsMargins(15, 12, 15, 12)
-        
-        # Truncate Name to Triple name and ID to safe Integer
-        raw_name = self.user_data.get("name", "مستشار النظام")
-        name_parts = raw_name.split()
-        triple_name = " ".join(name_parts[:3]) if len(name_parts) >= 3 else raw_name
-        emp_id = int(float(self.user_data.get("ID", 0)))
-
-        self.user_label = QLabel(f"المستشار الحالي: {triple_name}\nالرقم المالي: {emp_id}", self)
-        self.user_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.user_label.setStyleSheet("color: #3c4043; line-height: 24px;")
-        self.user_label.setAlignment(Qt.AlignRight)
-        self.user_layout.addWidget(self.user_label)
-        self.right_layout.addWidget(self.user_card)
-
-        # 2. Target Month Card (Flanked with zero/minimal spacing)
-        self.month_card = QFrame(self)
-        self.month_card.setStyleSheet("background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 8px;")
-        self.month_layout = QHBoxLayout(self.month_card)
-        self.month_layout.setContentsMargins(15, 12, 15, 12)
-        self.month_layout.setSpacing(2) # Flanked closely
+        self.month_bar_layout = QHBoxLayout(self.month_bar)
+        self.month_bar_layout.setContentsMargins(12, 10, 12, 10)
+        self.month_bar_layout.setSpacing(2)  # ملاصقة تامة للأزرار
 
         self.btn_dec_month = QPushButton("-", self)
-        self.btn_dec_month.setFixedSize(36, 36)
-        self.btn_dec_month.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.btn_dec_month.setFixedSize(34, 34)
+        self.btn_dec_month.setFont(QFont("Segoe UI", 15, QFont.Bold))
         self.btn_dec_month.setStyleSheet("""
-            QPushButton {
-                background-color: #f8f9fa; border: 1px solid #dadce0; border-radius: 4px; color: #3c4043;
-            }
-            QPushButton:hover { background-color: #e8eaed; }
+            QPushButton { background-color: #F8F9FA; border: 1px solid #DADCE0;
+                          border-radius: 5px; color: #202124; }
+            QPushButton:hover { background-color: #E8EAED; }
+            QPushButton:pressed { background-color: #DADCE0; }
         """)
         self.btn_dec_month.clicked.connect(self.decrement_month)
-        self.month_layout.addWidget(self.btn_dec_month)
+        self.month_bar_layout.addWidget(self.btn_dec_month)
 
         self.month_input = QLineEdit(self)
         self.month_input.setReadOnly(True)
         self.month_input.setAlignment(Qt.AlignCenter)
-        self.month_input.setFont(QFont("Segoe UI", 13, QFont.Bold))
-        self.month_input.setFixedSize(160, 36)
-        self.month_input.setStyleSheet("border: 1px solid #dadce0; border-radius: 4px; background-color: #ffffff; color: #202124;")
-        self.month_layout.addWidget(self.month_input)
+        self.month_input.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.month_input.setFixedSize(140, 34)
+        self.month_input.setStyleSheet(
+            "border: 1px solid #DADCE0; border-radius: 5px;"
+            "background-color: #FFFFFF; color: #111827;"
+        )
+        self.month_bar_layout.addWidget(self.month_input)
 
         self.btn_inc_month = QPushButton("+", self)
-        self.btn_inc_month.setFixedSize(36, 36)
-        self.btn_inc_month.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.btn_inc_month.setFixedSize(34, 34)
+        self.btn_inc_month.setFont(QFont("Segoe UI", 15, QFont.Bold))
         self.btn_inc_month.setStyleSheet("""
-            QPushButton {
-                background-color: #f8f9fa; border: 1px solid #dadce0; border-radius: 4px; color: #3c4043;
-            }
-            QPushButton:hover { background-color: #e8eaed; }
+            QPushButton { background-color: #F8F9FA; border: 1px solid #DADCE0;
+                          border-radius: 5px; color: #202124; }
+            QPushButton:hover { background-color: #E8EAED; }
+            QPushButton:pressed { background-color: #DADCE0; }
         """)
         self.btn_inc_month.clicked.connect(self.increment_month)
-        self.month_layout.addWidget(self.btn_inc_month)
+        self.month_bar_layout.addWidget(self.btn_inc_month)
 
-        self.right_layout.addWidget(self.month_card)
-
-        # 3. Monthly Statistics Card
-        self.stats_card = QFrame(self)
-        self.stats_card.setStyleSheet("background-color: #ffffff; border: 1px solid #e8eaed; border-radius: 8px;")
-        self.stats_layout = QVBoxLayout(self.stats_card)
-        self.stats_layout.setContentsMargins(15, 15, 15, 15)
-        self.stats_layout.setSpacing(10)
-
+        # المساحة المتبقية: إحصائيات الشهر المستهدف
+        self.month_bar_layout.addSpacing(18)
         self.stats_title = QLabel("إحصائيات الشهر المستهدف", self)
         self.stats_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.stats_title.setStyleSheet("color: #3c4043; border-bottom: 1px solid #f1f3f4; padding-bottom: 5px;")
-        self.stats_layout.addWidget(self.stats_title)
+        self.stats_title.setStyleSheet("color: #111827; border: none;")
+        self.month_bar_layout.addWidget(self.stats_title)
+        self.month_bar_layout.addSpacing(6)
 
-        self.lbl_stat_work = QLabel("أيام العمل: -", self)
+        self.lbl_stat_work = QLabel("عمل: -", self)
         self.lbl_stat_work.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.lbl_stat_work.setStyleSheet("color: #202124;")
-        self.stats_layout.addWidget(self.lbl_stat_work)
+        self.lbl_stat_work.setStyleSheet("color: #1F2937; border: none; padding: 2px 8px;"
+                                         "background-color: #F3F4F6; border-radius: 4px;")
+        self.month_bar_layout.addWidget(self.lbl_stat_work)
 
-        self.lbl_stat_rest = QLabel("أيام الراحة (R): -", self)
+        self.lbl_stat_rest = QLabel("راحة R: -", self)
         self.lbl_stat_rest.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.lbl_stat_rest.setStyleSheet("color: #5f6368;")
-        self.stats_layout.addWidget(self.lbl_stat_rest)
+        self.lbl_stat_rest.setStyleSheet("color: #991B1B; border: none; padding: 2px 8px;"
+                                         "background-color: #FFEAEA; border-radius: 4px;")
+        self.month_bar_layout.addWidget(self.lbl_stat_rest)
 
-        self.lbl_stat_wh = QLabel("أيام العمل عن بعد (WH): -", self)
+        self.lbl_stat_wh = QLabel("WH: -", self)
         self.lbl_stat_wh.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.lbl_stat_wh.setStyleSheet("color: #8e24aa;")
-        self.stats_layout.addWidget(self.lbl_stat_wh)
+        self.lbl_stat_wh.setStyleSheet("color: #8E24AA; border: none; padding: 2px 8px;"
+                                       "background-color: #F3E5F5; border-radius: 4px;")
+        self.month_bar_layout.addWidget(self.lbl_stat_wh)
 
-        self.lbl_stat_h = QLabel("أيام العطلات الرسمية (H): -", self)
+        self.lbl_stat_h = QLabel("عطلة H: -", self)
         self.lbl_stat_h.setFont(QFont("Segoe UI", 10, QFont.Bold))
-        self.lbl_stat_h.setStyleSheet("color: #1a73e8;")
-        self.stats_layout.addWidget(self.lbl_stat_h)
+        self.lbl_stat_h.setStyleSheet("color: #0369A1; border: none; padding: 2px 8px;"
+                                      "background-color: #E0F2FE; border-radius: 4px;")
+        self.month_bar_layout.addWidget(self.lbl_stat_h)
 
-        self.right_layout.addWidget(self.stats_card)
+        self.month_bar_layout.addStretch(1)
+        self.calendar_layout.addWidget(self.month_bar)
 
-        # 4. Live Green Status Card
+        # شريط خانات الاختيار
+        self.control_bar = QFrame(self)
+        self.control_bar.setStyleSheet(
+            "QFrame { background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px; }"
+        )
+        self.bar_layout = QHBoxLayout(self.control_bar)
+        self.bar_layout.setContentsMargins(12, 8, 12, 8)
+        self.bar_layout.setSpacing(24)
+
+        check_wh_png = make_checkmark_png("#8E24AA")
+        check_h_png = make_checkmark_png("#0369A1")
+
+        self.wfh_chk = QCheckBox("العمل عن بعد (الأحد)", self)
+        self.wfh_chk.setChecked(True)
+        self.wfh_chk.setStyleSheet(checkbox_stylesheet("#8E24AA", check_wh_png))
+        self.wfh_chk.stateChanged.connect(self.on_wfh_state_changed)
+        self.bar_layout.addWidget(self.wfh_chk)
+
+        self.holidays_chk = QCheckBox("العطلات الرسمية (H)", self)
+        self.holidays_chk.setChecked(False)
+        self.holidays_chk.setStyleSheet(checkbox_stylesheet("#0369A1", check_h_png))
+        self.bar_layout.addWidget(self.holidays_chk)
+
+        self.bar_layout.addStretch(1)
+        self.calendar_layout.addWidget(self.control_bar)
+
+        # إطار التقويم الرئيسي (Excel Grid متصل)
+        self.calendar_wrapper = QFrame(self)
+        self.calendar_wrapper.setStyleSheet(
+            "QFrame { background-color: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 8px; }"
+        )
+        self.inner_calendar_layout = QVBoxLayout(self.calendar_wrapper)
+        self.inner_calendar_layout.setContentsMargins(8, 8, 8, 8)
+        self.inner_calendar_layout.setSpacing(0)
+
+        # رأس الأيام: يبدأ من الأحد (أقصى اليمين) حتى السبت (أقصى اليسار)
+        self.header_grid = QGridLayout()
+        self.header_grid.setSpacing(0)
+        weekdays = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+        for idx, day_name in enumerate(weekdays):
+            lbl = QLabel(day_name, self)
+            lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setFixedHeight(32)
+            lbl.setStyleSheet("color: #1F2937; background-color: #F8FAFC;"
+                              "border: 1px solid #D1D5DB; border-bottom: 2px solid #D1D5DB;")
+            self.header_grid.addWidget(lbl, 0, idx)
+        self.inner_calendar_layout.addLayout(self.header_grid)
+
+        # شبكة التقويم (مسافات صفر لضمان الاتصال الكامل)
+        self.grid_layout = QGridLayout()
+        self.grid_layout.setSpacing(0)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.inner_calendar_layout.addLayout(self.grid_layout)
+
+        self.calendar_layout.addWidget(self.calendar_wrapper, 1)
+
+        # --------------------------------------------------
+        # يساراً: سجل الإخراج + حالة الاتصال + الأزرار
+        # --------------------------------------------------
+        self.controls_pane = QWidget(self)
+        self.controls_pane.setFixedWidth(360)
+        self.controls_layout = QVBoxLayout(self.controls_pane)
+        self.controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.controls_layout.setSpacing(14)
+
+        # كارت حالة قاعدة البيانات
         self.status_card = QFrame(self)
-        self.status_card.setStyleSheet("background-color: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 8px;")
+        self.status_card.setStyleSheet(
+            "QFrame { background-color: #E8F5E9; border: 1px solid #C8E6C9; border-radius: 8px; }"
+        )
         self.status_layout = QVBoxLayout(self.status_card)
-        self.status_layout.setContentsMargins(15, 12, 15, 12)
+        self.status_layout.setContentsMargins(14, 12, 14, 12)
         self.status_layout.setSpacing(6)
 
-        self.lbl_status_indicator = QLabel("حالة قاعدة البيانات: متصلة ونشطة 🟢", self)
+        self.lbl_status_indicator = QLabel("حالة قاعدة البيانات: جارٍ التحقق...", self)
         self.lbl_status_indicator.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.lbl_status_indicator.setStyleSheet("color: #1b5e20;")
+        self.lbl_status_indicator.setStyleSheet("color: #1B5E20; border: none;")
         self.status_layout.addWidget(self.lbl_status_indicator)
 
         self.lbl_db_details = QLabel(self)
         self.lbl_db_details.setFont(QFont("Segoe UI", 10))
-        self.lbl_db_details.setStyleSheet("color: #2e7d32; line-height: 18px;")
+        self.lbl_db_details.setStyleSheet("color: #2E7D32; line-height: 18px; border: none;")
         self.lbl_db_details.setWordWrap(True)
-        
-        # Display the real physical path in small font
         db_file_name = os.path.basename(self.ts_path) if self.ts_path else "TIME SHEET.mdb"
         self.lbl_db_details.setText(
             f"<b>قاعدة البيانات:</b> {db_file_name}<br>"
             f"<b>المسار الفعلي:</b> {self.ts_path}<br>"
-            f"<b>الجدول النشط:</b> DatePrep & var_op"
+            f"<b>الجدول النشط:</b> DatePrep &amp; var_op"
         )
         self.status_layout.addWidget(self.lbl_db_details)
-        self.right_layout.addWidget(self.status_card)
+        self.controls_layout.addWidget(self.status_card)
 
-        # Progress Bar & Thread Status (Shown during computation)
+        # سجل الإخراج
+        log_title = QLabel("سجل الإخراج", self)
+        log_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        log_title.setStyleSheet("color: #111827;")
+        self.controls_layout.addWidget(log_title)
+
+        self.output_log = QListWidget(self)
+        self.output_log.setStyleSheet("""
+            QListWidget {
+                background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px;
+                color: #202124; font-size: 10pt; padding: 4px;
+            }
+            QListWidget::item { padding: 3px; border-bottom: 1px solid #F1F3F4; }
+        """)
+        self.controls_layout.addWidget(self.output_log, 1)
+
+        # شريط التقدم وحالة الخيط
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setVisible(False)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
-                border: 1px solid #dadce0; border-radius: 6px; text-align: center; background-color: #ffffff;
+                border: 1px solid #DADCE0; border-radius: 6px; text-align: center;
+                background-color: #FFFFFF; color: #202124;
             }
-            QProgressBar::chunk {
-                background-color: #34a853; border-radius: 5px;
-            }
+            QProgressBar::chunk { background-color: #34A853; border-radius: 5px; }
         """)
-        self.right_layout.addWidget(self.progress_bar)
+        self.controls_layout.addWidget(self.progress_bar)
 
         self.lbl_thread_status = QLabel("", self)
         self.lbl_thread_status.setFont(QFont("Segoe UI", 10))
-        self.lbl_thread_status.setStyleSheet("color: #5f6368;")
+        self.lbl_thread_status.setStyleSheet("color: #5F6368;")
         self.lbl_thread_status.setAlignment(Qt.AlignCenter)
         self.lbl_thread_status.setVisible(False)
-        self.right_layout.addWidget(self.lbl_thread_status)
+        self.controls_layout.addWidget(self.lbl_thread_status)
 
-        # Spacer to push action buttons down
-        self.right_layout.addStretch()
+        self.controls_layout.addStretch()
 
-        # 5. Action Buttons (Vertical in Column A)
-        self.btn_initialize = QPushButton("بدء تهيئة الشهر", self)
+        # زر التهيئة (أخضر زمردي)
+        self.btn_initialize = QPushButton("التهيئة", self)
         self.btn_initialize.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.btn_initialize.setFixedHeight(48)
+        self.btn_initialize.setFixedHeight(46)
         self.btn_initialize.setStyleSheet("""
             QPushButton {
-                background-color: #1a73e8; color: #ffffff; border: none; border-radius: 6px;
+                background-color: #059669; color: #FFFFFF; border: none; border-radius: 6px;
             }
-            QPushButton:hover { background-color: #1557b0; }
+            QPushButton:hover { background-color: #047857; }
+            QPushButton:pressed { background-color: #065F46; }
+            QPushButton:disabled { background-color: #A7F3D0; color: #ECFDF5; }
         """)
         self.btn_initialize.clicked.connect(self.trigger_initialization)
-        self.right_layout.addWidget(self.btn_initialize)
+        self.controls_layout.addWidget(self.btn_initialize)
 
-        self.btn_back = QPushButton("رجوع", self)
+        # زر الرجوع (أحمر نابض)
+        self.btn_back = QPushButton("الرجوع", self)
         self.btn_back.setFont(QFont("Segoe UI", 11, QFont.Bold))
-        self.btn_back.setFixedHeight(48)
+        self.btn_back.setFixedHeight(46)
         self.btn_back.setStyleSheet("""
             QPushButton {
-                background-color: #f8f9fa; color: #3c4043; border: 1px solid #dadce0; border-radius: 6px;
+                background-color: #DC2626; color: #FFFFFF; border: none; border-radius: 6px;
             }
-            QPushButton:hover { background-color: #e8eaed; }
+            QPushButton:hover { background-color: #B91C1C; }
+            QPushButton:pressed { background-color: #991B1B; }
+            QPushButton:disabled { background-color: #FCA5A5; color: #FEF2F2; }
         """)
         self.btn_back.clicked.connect(self.close)
-        self.right_layout.addWidget(self.btn_back)
+        self.controls_layout.addWidget(self.btn_back)
 
-        self.main_layout.addWidget(self.right_pane)
+        # ترتيب الألواح: التقويم يميناً (يُضاف أولاً في RTL) والتحكم يساراً
+        self.main_layout.addWidget(self.calendar_pane, 3)
+        self.main_layout.addWidget(self.controls_pane)
 
-        # Load target month
         self.update_month_display()
 
+    # ------------------------------------------------------------------
+    # حالة الاتصال
+    # ------------------------------------------------------------------
+    def refresh_connection_status(self):
+        try:
+            ok, msg = self.db.test_connection(self.ts_path, self.ts_pwd)
+            if ok:
+                self.lbl_status_indicator.setText("حالة قاعدة البيانات: متصلة ونشطة 🟢")
+                self.lbl_status_indicator.setStyleSheet("color: #1B5E20; border: none;")
+                self.status_card.setStyleSheet(
+                    "QFrame { background-color: #E8F5E9; border: 1px solid #C8E6C9; border-radius: 8px; }"
+                )
+            else:
+                self.lbl_status_indicator.setText("حالة قاعدة البيانات: غير متصلة 🔴")
+                self.lbl_status_indicator.setStyleSheet("color: #B71C1C; border: none;")
+                self.status_card.setStyleSheet(
+                    "QFrame { background-color: #FDECEA; border: 1px solid #F5C6C0; border-radius: 8px; }"
+                )
+        except Exception as e:
+            self.lbl_status_indicator.setText("حالة قاعدة البيانات: غير متصلة 🔴")
+            self.lbl_status_indicator.setStyleSheet("color: #B71C1C; border: none;")
+            self.status_card.setStyleSheet(
+                "QFrame { background-color: #FDECEA; border: 1px solid #F5C6C0; border-radius: 8px; }"
+            )
+            self.append_log(f"فشل اختبار الاتصال: {e}")
+
+    def append_log(self, text):
+        item = QListWidgetItem(f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
+        self.output_log.addItem(item)
+        self.output_log.scrollToBottom()
+
+    # ------------------------------------------------------------------
+    # التنقل بين الشهور
+    # ------------------------------------------------------------------
     def update_month_display(self):
-        """تحديث بيانات الشهر المالي المكتوب وتوليد خلايا التقويم ديناميكياً"""
-        self.month_str = f"{self.current_year}{self.current_month:02d}"
-        self.month_input.setText(self.month_str)
+        self.issue = f"{self.current_year}{self.current_month:02d}"
+        self.month_input.setText(f"{self.current_month:02d}-{self.current_year}")
         self.generate_calendar_grid()
 
     def decrement_month(self):
@@ -612,42 +668,40 @@ class MonthPrepWindow(QMainWindow):
         self.update_month_display()
 
     def on_wfh_state_changed(self):
-        """تحديث أنماط أيام الأحد تلقائياً عند تغيير حالة العمل عن بعد"""
+        """تحديث أيام الأحد تلقائياً عند تغيير تفعيل العمل عن بعد."""
         for day_num, card in self.day_widgets.items():
-            if card.day_type in ('WORK', 'WH'):
-                current_date = datetime(self.current_year, self.current_month, day_num)
-                if current_date.weekday() == 6: # Sunday
-                    card.day_type = 'WH' if self.wfh_chk.isChecked() else 'WORK'
-                    card.apply_state_style()
+            current_date = datetime(self.current_year, self.current_month, day_num)
+            if current_date.weekday() == 6 and card.day_type in ('WORK', 'WH'):
+                card.day_type = 'WH' if self.wfh_chk.isChecked() else 'WORK'
+                card.apply_state_style()
         self.update_statistics()
 
+    # ------------------------------------------------------------------
+    # شبكة التقويم
+    # ------------------------------------------------------------------
     def generate_calendar_grid(self):
-        """تنظيف وتوليد خلايا التقويم الجداري RTL وفق أول عمود على اليمين الجمعة"""
-        # Clean current grid widgets
-        for i in reversed(range(self.grid_layout.count())): 
+        """توليد خلايا التقويم RTL: الأحد أقصى اليمين ثم حتى السبت أقصى اليسار."""
+        for i in reversed(range(self.grid_layout.count())):
             widget = self.grid_layout.itemAt(i).widget()
             if widget is not None:
                 widget.deleteLater()
-        
         self.day_widgets.clear()
 
-        # Determine start weekday and total days
         first_day_weekday = date(self.current_year, self.current_month, 1).weekday()
         num_days = calendar.monthrange(self.current_year, self.current_month)[1]
 
-        # Monday(0)->col4, Tuesday(1)->col3, Wednesday(2)->col2, Thursday(3)->col1, Friday(4)->col0, Sunday(6)->col5, Saturday(5)->col6
-        mapping = {4: 0, 3: 1, 2: 2, 1: 3, 0: 4, 6: 5, 5: 6}
+        # خريطة weekday() إلى العمود: الأحد(6)->عمود0 (يمين)، السبت(5)->عمود6 (يسار)
+        mapping = {6: 0, 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6}
         col = mapping[first_day_weekday]
         row = 1
 
         for day_num in range(1, num_days + 1):
             current_date = datetime(self.current_year, self.current_month, day_num)
-            day_of_week = current_date.weekday()
+            dow = current_date.weekday()
 
-            # Determine default type
-            if day_of_week in (4, 5): # Friday/Saturday
+            if dow in (4, 5):
                 day_type = 'REST'
-            elif day_of_week == 6 and self.wfh_chk.isChecked(): # Sunday WH
+            elif dow == 6 and self.wfh_chk.isChecked():
                 day_type = 'WH'
             else:
                 day_type = 'WORK'
@@ -664,12 +718,7 @@ class MonthPrepWindow(QMainWindow):
         self.update_statistics()
 
     def update_statistics(self):
-        """حساب وعرض إحصائيات الشهر المستهدف ديناميكياً بأرقام حقيقية"""
-        work = 0
-        rest = 0
-        wh = 0
-        holiday = 0
-
+        work = rest = wh = holiday = 0
         for card in self.day_widgets.values():
             if card.day_type == 'WORK':
                 work += 1
@@ -680,101 +729,177 @@ class MonthPrepWindow(QMainWindow):
             elif card.day_type == 'HOLIDAY':
                 holiday += 1
 
-        self.lbl_stat_work.setText(f"أيام العمل: {work} يوم")
-        self.lbl_stat_rest.setText(f"أيام الراحة (R): {rest} يوم")
-        self.lbl_stat_wh.setText(f"أيام العمل عن بعد (WH): {wh} يوم")
-        self.lbl_stat_h.setText(f"أيام العطلات الرسمية (H): {holiday} يوم")
+        self.lbl_stat_work.setText(f"عمل: {work}")
+        self.lbl_stat_rest.setText(f"راحة R: {rest}")
+        self.lbl_stat_wh.setText(f"WH: {wh}")
+        self.lbl_stat_h.setText(f"عطلة H: {holiday}")
 
     def get_holidays_list(self):
-        """الحصول على قائمة الأيام المعلمة كعطلة رسمية H"""
         return [day_num for day_num, card in self.day_widgets.items() if card.day_type == 'HOLIDAY']
 
+    # ------------------------------------------------------------------
+    # دورة التهيئة الكاملة
+    # ------------------------------------------------------------------
     def trigger_initialization(self):
-        """التحقق الوقائي وإطلاق خيط المعالجة بالخلفية لترحيل السجلات"""
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            return
+        if self.pre_check_thread is not None and self.pre_check_thread.isRunning():
+            return
+
         holidays = self.get_holidays_list()
         h_count = len(holidays)
 
-        # Secure RTL Confirmation Message Boxes
+        # رسالة التأكيد الأصلية للحفاظ على سلوك النظام (تأكيد العطلات)
         if h_count > 0:
-            question_text = f"لقد قمت بتحديد عدد {h_count} أيام كعطلات رسمية (H) لهذا الشهر. هل أنت متأكد من صحة هذه العطلات وتريد الاستمرار في عملية التهيئة؟"
+            question_text = (f"لقد قمت بتحديد عدد {h_count} أيام كعطلات رسمية (H) لهذا الشهر. "
+                             "هل أنت متأكد من صحة هذه العطلات وتريد الاستمرار في عملية التهيئة؟")
         else:
-            question_text = "تحذير: لم تقم بتحديد أي أيام كعطلات رسمية (H) لهذا الشهر. هل أنت متأكد من الرغبة في تهيئة الشهر بالكامل كأيام عمل اعتيادية بدون أي عطلات رسمية؟"
+            question_text = ("تحذير: لم تقم بتحديد أي أيام كعطلات رسمية (H) لهذا الشهر. "
+                             "هل أنت متأكد من الرغبة في تهيئة الشهر بالكامل كأيام عمل اعتيادية بدون أي عطلات رسمية؟")
 
-        reply = QMessageBox.question(self, "تأكيد إطلاق التهيئة", question_text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
+        reply = QMessageBox.question(self, "تأكيد إطلاق التهيئة", question_text,
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.No:
             return
 
-        # Disable main control buttons to prevent multi-clicking
-        self.btn_initialize.setEnabled(False)
-        self.btn_back.setEnabled(False)
-        self.btn_dec_month.setEnabled(False)
-        self.btn_inc_month.setEnabled(False)
-        self.wfh_chk.setEnabled(False)
-        self.holidays_chk.setEnabled(False)
-
-        # Show progress widgets
+        self.set_controls_enabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self.lbl_thread_status.setText("جاري التحضير لبدء المعالجة...")
+        self.lbl_thread_status.setText("جارٍ التحقق المسبق من البيانات...")
         self.lbl_thread_status.setVisible(True)
+        self.append_log(f"بدء الفحص المسبق للشهر {self.issue}...")
 
-        # Launch QThread background worker
+        # الفحص المسبق الصامت في خيط منفصل (لا تجميد)
+        self.pre_check_thread = MonthPreCheckThread(
+            db_helper=self.db, ts_path=self.ts_path, ts_pwd=self.ts_pwd, issue=self.issue
+        )
+        self.pre_check_thread.pre_check_result.connect(self.on_pre_check_result)
+        self.pre_check_thread.finished.connect(self._clear_pre_check_thread)
+        self.pre_check_thread.start()
+
+    def _clear_pre_check_thread(self):
+        self.pre_check_thread = None
+
+    def on_pre_check_result(self, ok, has_records, count, present_days, error):
+        if not ok:
+            self.set_controls_enabled(True)
+            self.progress_bar.setVisible(False)
+            self.lbl_thread_status.setVisible(False)
+            self.append_log(f"فشل الفحص المسبق: {error}")
+            QMessageBox.critical(
+                self, "فشل الاتصال / التهيئة 🔴",
+                f"تعذر إتمام الفحص المسبق لقاعدة البيانات.\n\n{translate_odbc_error(error)}"
+            )
+            return
+
+        num_days = calendar.monthrange(self.current_year, self.current_month)[1]
+
+        # 1) هل الشهر مُهيأ مسبقاً؟ -> رسالة تأكيد إعادة التهيئة
+        if has_records:
+            self.append_log(f"التحقق المسبق: الشهر مُهيأ مسبقاً ({count:,} سجل موجود).")
+            confirm = QMessageBox.question(
+                self, "تأكيد إعادة التهيئة",
+                "هذا الشهر تمت تهيئته مسبقاً، هل تريد إعادة التهيئة ومسح الحركات الحالية؟",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if confirm == QMessageBox.No:
+                self.set_controls_enabled(True)
+                self.progress_bar.setVisible(False)
+                self.lbl_thread_status.setVisible(False)
+                self.append_log("تم إلغاء إعادة التهيئة بواسطة المستخدم.")
+                return
+
+            # 2) التحقق من اكتمال الأيام: أي يوم مفقود = إيقاف صريح
+            required_days = set(range(1, num_days + 1))
+            missing = required_days - set(present_days)
+            if missing:
+                missing_text = ", ".join(str(d) for d in sorted(missing))
+                self.set_controls_enabled(True)
+                self.progress_bar.setVisible(False)
+                self.lbl_thread_status.setVisible(False)
+                self.append_log(f"إيقاف التهيئة: أيام مفقودة من var_op ({missing_text}).")
+                QMessageBox.critical(
+                    self, "فشل الاتصال / التهيئة 🔴",
+                    f"توقفت عملية التهيئة: بعض أيام الشهر غير موجودة في جدول var_op.\n"
+                    f"الأيام المفقودة: {missing_text}\n"
+                    f"لا يمكن متابعة التهيئة قبل اكتمال أيام الشهر في قاعدة البيانات."
+                )
+                return
+        else:
+            self.append_log(f"التحقق المسبق: الشهر غير مُهيأ مسبقاً ({count} سجل).")
+
+        # 3) إطلاق خيط التهيئة
+        self.append_log("بدء عملية التهيئة في الخلفية...")
+        self.lbl_thread_status.setText("جارٍ تحضير خيط التهيئة...")
+
         self.worker_thread = MonthPrepThread(
+            db_helper=DatabaseConnection(retry_attempts=3, retry_delay_ms=120, connect_timeout=8),
             main_path=self.main_path,
             ts_path=self.ts_path,
             main_pwd=self.main_pwd,
             ts_pwd=self.ts_pwd,
-            target_month=self.month_str,
+            year=self.current_year,
+            month=self.current_month,
+            issue=self.issue,
+            num_days=num_days,
             wfh_active=self.wfh_chk.isChecked(),
-            holidays_list=holidays
+            holidays_list=holidays,
         )
-
         self.worker_thread.progress_updated.connect(self.on_thread_progress)
         self.worker_thread.status_updated.connect(self.on_thread_status)
         self.worker_thread.initialization_completed.connect(self.on_thread_success)
         self.worker_thread.initialization_failed.connect(self.on_thread_failed)
-
         self.worker_thread.start()
+
+    # ------------------------------------------------------------------
+    # استدعاءات الخيط
+    # ------------------------------------------------------------------
+    def set_controls_enabled(self, enabled):
+        self.btn_initialize.setEnabled(enabled)
+        self.btn_back.setEnabled(enabled)
+        self.btn_dec_month.setEnabled(enabled)
+        self.btn_inc_month.setEnabled(enabled)
+        self.wfh_chk.setEnabled(enabled)
+        self.holidays_chk.setEnabled(enabled)
 
     def on_thread_progress(self, val):
         self.progress_bar.setValue(val)
 
     def on_thread_status(self, text):
         self.lbl_thread_status.setText(text)
+        self.append_log(text)
 
     def on_thread_success(self, employees, records):
         self.progress_bar.setVisible(False)
         self.lbl_thread_status.setVisible(False)
-
-        # Enable UI
-        self.btn_initialize.setEnabled(True)
-        self.btn_back.setEnabled(True)
-        self.btn_dec_month.setEnabled(True)
-        self.btn_inc_month.setEnabled(True)
-        self.wfh_chk.setEnabled(True)
-        self.holidays_chk.setEnabled(True)
+        self.set_controls_enabled(True)
+        self.worker_thread = None
+        self.append_log(f"اكتملت التهيئة: {employees} موظف و {records:,} سجل.")
 
         QMessageBox.information(
-            self, "تمت العملية بنجاح 🟢", 
-            f"تمت عملية تهيئة الشهر {self.month_str} بنجاح!\n"
+            self, "تمت العملية بنجاح 🟢",
+            f"تمت تهيئة الشهر {self.issue} بنجاح.\n"
             f"تمت معالجة {employees} موظف فاعل.\n"
-            f"إجمالي السجلات التي تم إدراجها في var_op: {records} سجل حضور فارغ."
+            f"إجمالي السجلات التي تم إنشاؤها في var_op: {records:,} سجل."
         )
 
     def on_thread_failed(self, error_msg):
         self.progress_bar.setVisible(False)
         self.lbl_thread_status.setVisible(False)
+        self.set_controls_enabled(True)
+        self.worker_thread = None
+        self.append_log(f"فشلت التهيئة: {error_msg}")
 
-        # Enable UI
-        self.btn_initialize.setEnabled(True)
-        self.btn_back.setEnabled(True)
-        self.btn_dec_month.setEnabled(True)
-        self.btn_inc_month.setEnabled(True)
-        self.wfh_chk.setEnabled(True)
-        self.holidays_chk.setEnabled(True)
-
+        arabic_msg = translate_odbc_error(error_msg)
         QMessageBox.critical(
-            self, "فشل الاتصال / التهيئة 🔴", 
-            f"فشلت عملية تهيئة الشهر بسبب الخطأ التالي:\n{error_msg}"
+            self, "فشل الاتصال / التهيئة 🔴",
+            f"فشلت عملية تهيئة الشهر.\n\n{arabic_msg}\n\n(الخطأ التقني: {error_msg})"
         )
+
+    def closeEvent(self, event):
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self.worker_thread.requestInterruption()
+            self.worker_thread.wait(3000)
+        if self.pre_check_thread is not None and self.pre_check_thread.isRunning():
+            self.pre_check_thread.wait(2000)
+        super().closeEvent(event)
