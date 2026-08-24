@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QFrame, QCheckBox, QProgressBar
 )
 from PySide6.QtCore import Qt, QThread, Signal, QRectF, QRect
-from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QImage, QPen, QBrush
+from PySide6.QtGui import QFont, QColor, QPainter, QPainterPath, QImage, QPen, QBrush, QIcon
 
 from db_connection import DatabaseConnection
 
@@ -212,7 +212,7 @@ class MonthPrepThread(QThread):
 # ======================================================================
 
 class DayCardWidget(QFrame):
-    """خلية يوم واحدة داخل شبكة التقويم المتصلة (Gridlines رفيعة #D1D5DB)."""
+    """خلية يوم في شبكة Excel المتصلة — لون العمود كاملاً في كتلة نص واحدة بدون صناديق فرعية."""
     def __init__(self, day_num, day_type, parent_window):
         super().__init__()
         self.day_num = day_num
@@ -222,63 +222,41 @@ class DayCardWidget(QFrame):
 
     def init_ui(self):
         self.setFrameShape(QFrame.NoFrame)
-        self.setFixedSize(96, 64)
+        self.setFixedSize(96, 62)
 
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(2, 3, 2, 3)
+        self.layout.setContentsMargins(2, 4, 2, 2)
         self.layout.setSpacing(0)
 
-        self.num_label = QLabel(str(self.day_num), self)
-        self.num_label.setObjectName("dayNum")
-        self.num_label.setFont(QFont("Segoe UI", 13, QFont.Bold))
-        self.num_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.num_label)
-
-        self.code_label = QLabel("", self)
-        self.code_label.setObjectName("codeLabel")
-        self.code_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        self.code_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.code_label, 1)
+        self.text_label = QLabel("", self)
+        self.text_label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.text_label)
 
         self.apply_state_style()
 
     def apply_state_style(self):
-        """تطبيق لوحة الألوان المعتمدة في المواصفات بدقة عالية."""
-        if self.day_type == 'REST':
-            # الجمعة والسبت (راحة R) — وردي فاتح
-            self.setStyleSheet("""
-                DayCardWidget { background-color: #FFEAEA; border: 1px solid #D1D5DB; }
-                QLabel#dayNum { color: #1F2937; }
-                QLabel#codeLabel { color: #991B1B; }
-            """)
-            self.code_label.setText("R")
+        """تلوين الخلية حسب العمود: كتلة نص واحدة (رقم اليوم فوق + الكود أسفله) بخط كبير عريض."""
+        if self.day_type == 'HOLIDAY':
+            bg, day_color, code, code_color = "#E0F2FE", "#1F2937", "H", "#0369A1"
+        elif self.day_type == 'REST':
+            bg, day_color, code, code_color = "#FFEAEA", "#1F2937", "R", "#991B1B"
         elif self.day_type == 'WH':
-            # الأحد (عمل عن بعد WH) — بنفسجي/موف ثابت
-            self.setStyleSheet("""
-                DayCardWidget { background-color: #F3E5F5; border: 1px solid #D1D5DB; }
-                QLabel#dayNum { color: #1F2937; }
-                QLabel#codeLabel { color: #8E24AA; }
-            """)
-            self.code_label.setText("WH")
-        elif self.day_type == 'HOLIDAY':
-            # عطلة رسمية (H) — أزرق سماوي فاتح
-            self.setStyleSheet("""
-                DayCardWidget { background-color: #E0F2FE; border: 1px solid #D1D5DB; }
-                QLabel#dayNum { color: #1F2937; }
-                QLabel#codeLabel { color: #0369A1; }
-            """)
-            self.code_label.setText("H")
+            bg, day_color, code, code_color = "#F3E5F5", "#8E24AA", "WH", "#8E24AA"
         else:
-            # أيام العمل العادية — أبيض نقي بدون كود (تبقى 0 في قاعدة البيانات)
-            self.setStyleSheet("""
-                DayCardWidget { background-color: #FFFFFF; border: 1px solid #D1D5DB; }
-                QLabel#dayNum { color: #1F2937; }
-                QLabel#codeLabel { color: #1F2937; }
-            """)
-            self.code_label.setText("")
+            bg, day_color, code, code_color = "#FFFFFF", "#1F2937", "", "#1F2937"
+
+        self.setStyleSheet(
+            f"DayCardWidget {{ background-color: {bg}; border: 1px solid #D1D5DB; }}"
+        )
+        if code:
+            html = (f"<div style='font-size:20pt; font-weight:bold; color:{day_color};'>{self.day_num}</div>"
+                    f"<div style='font-size:15pt; font-weight:bold; color:{code_color};'>{code}</div>")
+        else:
+            html = (f"<div style='font-size:20pt; font-weight:bold; color:{day_color};'>{self.day_num}</div>")
+        self.text_label.setText(html)
 
     def default_type(self):
-        """إرجاع الحالة الافتراضية لليوم حسب يوم الأسبوع."""
+        """الحالة الافتراضية للعمود حسب يوم الأسبوع."""
         current_date = datetime(self.parent_window.current_year,
                                 self.parent_window.current_month, self.day_num)
         dow = current_date.weekday()
@@ -289,7 +267,7 @@ class DayCardWidget(QFrame):
         return 'WORK'
 
     def mousePressEvent(self, event):
-        """فتح تعديل الخلايا فقط عند تفعيل خانة العطلات الرسمية (تبديل إلى H بضغطة واحدة)."""
+        """فتح كل الخلايا للتبديل إلى عطلة (H) بضغطة واحدة عند تفعيل خانة العطلات الرسمية."""
         if event.button() != Qt.LeftButton:
             return
         if not self.parent_window.holidays_chk.isChecked():
@@ -314,7 +292,7 @@ class MonthPrepWindow(QMainWindow):
         super().__init__(parent)
         self.config = config_manager
         self.db = db_connection
-        self.user_data = user_data
+        self.user_data = user_data or {}
 
         # إعدادات التاريخ الحالية
         now = datetime.now()
@@ -345,10 +323,17 @@ class MonthPrepWindow(QMainWindow):
     # البناء البصري
     # ------------------------------------------------------------------
     def init_ui(self):
-        self.setWindowTitle("تهيئة بداية الشهر (DatePrep & Movements Population)")
+        self.setWindowTitle("تهيئة الشهر الجديد")
         self.resize(1200, 780)
         self.setLayoutDirection(Qt.RightToLeft)
         self.setStyleSheet("background-color: #FAFBFC; font-family: 'Segoe UI';")
+
+        # أيقونة النافذة من مجلد الأصول (مع تحقق آمن من المسار)
+        icon_path = os.path.join(BASE_DIR, "assests", "logo.png")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(BASE_DIR, "assets", "logo.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         if self.statusBar():
             self.statusBar().setSizeGripEnabled(False)
@@ -374,7 +359,7 @@ class MonthPrepWindow(QMainWindow):
         """)
         self.month_bar_layout = QHBoxLayout(self.month_bar)
         self.month_bar_layout.setContentsMargins(12, 10, 12, 10)
-        self.month_bar_layout.setSpacing(2)  # ملاصقة تامة للأزرار
+        self.month_bar_layout.setSpacing(0)  # صفر مسافة: الأزرار ملاصقة تماماً لصندوق الشهر
 
         self.btn_dec_month = QPushButton("-", self)
         self.btn_dec_month.setFixedSize(34, 34)
@@ -458,13 +443,13 @@ class MonthPrepWindow(QMainWindow):
         check_wh_png = make_checkmark_png("#8E24AA")
         check_h_png = make_checkmark_png("#0369A1")
 
-        self.wfh_chk = QCheckBox("العمل عن بعد (الأحد)", self)
+        self.wfh_chk = QCheckBox("العمل عن بعد", self)
         self.wfh_chk.setChecked(True)
         self.wfh_chk.setStyleSheet(checkbox_stylesheet("#8E24AA", check_wh_png))
         self.wfh_chk.stateChanged.connect(self.on_wfh_state_changed)
         self.bar_layout.addWidget(self.wfh_chk)
 
-        self.holidays_chk = QCheckBox("العطلات الرسمية (H)", self)
+        self.holidays_chk = QCheckBox("العطلات الرسمية", self)
         self.holidays_chk.setChecked(False)
         self.holidays_chk.setStyleSheet(checkbox_stylesheet("#0369A1", check_h_png))
         self.bar_layout.addWidget(self.holidays_chk)
@@ -475,23 +460,30 @@ class MonthPrepWindow(QMainWindow):
         # إطار التقويم الرئيسي (Excel Grid متصل)
         self.calendar_wrapper = QFrame(self)
         self.calendar_wrapper.setStyleSheet(
-            "QFrame { background-color: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 8px; }"
+            "QFrame { background-color: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 0px; }"
         )
         self.inner_calendar_layout = QVBoxLayout(self.calendar_wrapper)
         self.inner_calendar_layout.setContentsMargins(8, 8, 8, 8)
         self.inner_calendar_layout.setSpacing(0)
 
-        # رأس الأيام: يبدأ من الأحد (أقصى اليمين) حتى السبت (أقصى اليسار)
+        # رأس الأيام: يبدأ من الأحد (أقصى اليمين) حتى السبت (أقصى اليسار) مع تلوين العمود كاملاً
         self.header_grid = QGridLayout()
         self.header_grid.setSpacing(0)
         weekdays = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"]
+        col_styles = {
+            0: "#F3E5F5;#8E24AA",  # عمود الأحد (WH) — موف/بنفسجي
+            5: "#FFEAEA;#991B1B",  # عمود الجمعة (R) — أحمر
+            6: "#FFEAEA;#991B1B",  # عمود السبت (R) — أحمر
+        }
         for idx, day_name in enumerate(weekdays):
             lbl = QLabel(day_name, self)
             lbl.setFont(QFont("Segoe UI", 11, QFont.Bold))
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setFixedHeight(32)
-            lbl.setStyleSheet("color: #1F2937; background-color: #F8FAFC;"
-                              "border: 1px solid #D1D5DB; border-bottom: 2px solid #D1D5DB;")
+            bg, fg = col_styles.get(idx, "#F8FAFC;#1F2937").split(";")
+            lbl.setStyleSheet(
+                f"QLabel {{ color: {fg}; background-color: {bg}; border: 1px solid #D1D5DB; }}"
+            )
             self.header_grid.addWidget(lbl, 0, idx)
         self.inner_calendar_layout.addLayout(self.header_grid)
 
@@ -648,7 +640,7 @@ class MonthPrepWindow(QMainWindow):
     # ------------------------------------------------------------------
     def update_month_display(self):
         self.issue = f"{self.current_year}{self.current_month:02d}"
-        self.month_input.setText(f"{self.current_month:02d}-{self.current_year}")
+        self.month_input.setText(f"{self.current_year}-{self.current_month:02d}")
         self.generate_calendar_grid()
 
     def decrement_month(self):
